@@ -1,9 +1,7 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from urllib.parse import quote, unquote
 
 from functions import CONFIG
 from utils import apply_spc_rules, get_rule_names_for_index
@@ -28,59 +26,111 @@ def load_dummy_data():
                 for year in years:
                     for week in weeks:
                         value = np.random.normal(loc=100, scale=10)
+                        usl = 120
+                        lsl = 80
                         data.append({
                             "prog": prog,
                             "variable": var,
                             "id_install": inst,
                             "value": value,
+                            "usl": usl,
+                            "lsl": lsl,
                             "year": year,
                             "week": week
                         })
 
     return pd.DataFrame(data)
 
-def wrap_text(text, width=30):
-    return '<br>'.join([text[i:i+width] for i in range(0, len(text), width)])
+# --- Load Data ---
+df = load_dummy_data()
 
-# --- Load and Validate Data ---
-data = load_dummy_data()
-required_columns = ['prog', 'variable', 'id_install', 'value', 'year', 'week']
-for col in required_columns:
-    if col not in data.columns:
-        st.error(f"Data is missing the required column: {col}")
-        st.stop()
+# --- Sidebar Filters ---
+st.sidebar.title("Filter Options")
+selected_prog = st.sidebar.selectbox("Program", sorted(df["prog"].unique()))
+selected_var = st.sidebar.selectbox("Variable", sorted(df["variable"].unique()))
+selected_inst = st.sidebar.selectbox("Installation", sorted(df["id_install"].unique()))
 
-# --- Sidebar Program Selection ---
-data['prog'] = data['prog'].astype(str).str.strip()
-desired_prog_order = sorted(data['prog'].unique().tolist())
-query_params = st.query_params
-default_prog = query_params.get("prog", desired_prog_order[0])
-selected_prog = st.sidebar.selectbox("Select Program", desired_prog_order, index=desired_prog_order.index(default_prog))
+# --- Filter Data ---
+filtered = df[
+    (df["prog"] == selected_prog) &
+    (df["variable"] == selected_var) &
+    (df["id_install"] == selected_inst)
+].copy()
 
-# --- Sidebar Variable & Installation Selection ---
-filtered_data = data[data['prog'] == selected_prog]
-available_vars = sorted(filtered_data['variable'].unique())
-selected_var = st.sidebar.selectbox("Select Variable", available_vars)
+# --- Sort and Prepare X Axis ---
+filtered = filtered.sort_values(by=["year", "week"])
+filtered["x"] = filtered["year"].astype(str) + "-W" + filtered["week"].astype(str).str.zfill(2)
 
-available_inst = sorted(filtered_data['id_install'].unique())
-selected_inst = st.sidebar.selectbox("Select Installation", available_inst)
+# --- Apply SPC Rules ---
+spc_result = apply_spc_rules(filtered["value"], usl=filtered["usl"], lsl=filtered["lsl"])
+filtered["Violation"] = spc_result["violation_flags"]
 
-# --- Filter Final Dataset ---
-plot_data = filtered_data[
-    (filtered_data["variable"] == selected_var) & 
-    (filtered_data["id_install"] == selected_inst)
-]
+# Add rule flags as columns
+rule_names = ["Rule 1", "Rule 2", "Rule 3", "Rule 4", "Rule 5", "Rule 5b", "Rule 7", "Rule 8"]
+if len(spc_result["flags"]) > len(rule_names):
+    rule_names.append("Rule 11")
+for name, flag_array in zip(rule_names, spc_result["flags"]):
+    filtered[name] = flag_array
 
-# --- Group and Plot ---
-plot_data = plot_data.sort_values(by=["year", "week"])
-plot_data["x"] = plot_data["year"].astype(str) + "-W" + plot_data["week"].astype(str).str.zfill(2)
-
-# Apply SPC rules
-plot_data = apply_spc_rules(plot_data, col="value", config=CONFIG.get(selected_var, {}))
-
-# SPC Plot
+# --- Plotting ---
 fig = go.Figure()
-fig.add_trace(go.Scatter(x=plot_data["x"], y=plot_data["value"], mode="lines+markers", name="Value"))
-fig.update_layout(title=f"SPC Chart for {selected_var} @ {selected_inst}", xaxis_title="Week", yaxis_title="Value")
 
+# Plot measured values
+fig.add_trace(go.Scatter(
+    x=filtered["x"],
+    y=filtered["value"],
+    mode="lines+markers",
+    name="Value"
+))
+
+# Highlight violations per rule
+for name in rule_names:
+    points = filtered[filtered[name]]
+    if not points.empty:
+        fig.add_trace(go.Scatter(
+            x=points["x"],
+            y=points["value"],
+            mode="markers",
+            name=f"⚠ {name}",
+            marker=dict(symbol="x", size=10)
+        ))
+
+# --- Control Limits ---
+mean_line = spc_result["mean"]
+ucl_line = spc_result["ucl"]
+lcl_line = spc_result["lcl"]
+
+fig.add_hline(y=mean_line, line_dash="dot", line_color="gray",
+              annotation_text="Mean", annotation_position="top left")
+
+fig.add_hline(y=ucl_line, line_dash="dash", line_color="red",
+              annotation_text="UCL", annotation_position="top left")
+
+fig.add_hline(y=lcl_line, line_dash="dash", line_color="red",
+              annotation_text="LCL", annotation_position="bottom left")
+
+# --- Specification Limits (USL/LSL) ---
+usl_avg = pd.to_numeric(filtered["usl"], errors="coerce").mean()
+lsl_avg = pd.to_numeric(filtered["lsl"], errors="coerce").mean()
+
+if not np.isnan(usl_avg):
+    fig.add_hline(y=usl_avg, line_dash="dot", line_color="blue",
+                  annotation_text="USL", annotation_position="top right")
+
+if not np.isnan(lsl_avg):
+    fig.add_hline(y=lsl_avg, line_dash="dot", line_color="blue",
+                  annotation_text="LSL", annotation_position="bottom right")
+
+# Final layout
+fig.update_layout(
+    title=f"SPC Chart for {selected_var} @ {selected_inst}",
+    xaxis_title="Week",
+    yaxis_title="Value",
+    height=500
+)
+
+# Render plot and rule documentation
 st.plotly_chart(fig, use_container_width=True)
+st.markdown(CONFIG["spc_rules"])
+
+
